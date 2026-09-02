@@ -2,10 +2,17 @@
 """
 DSO 429 HW1 auto-submit bot.
 
-Stateless by design: every run re-derives what still needs to be submitted by
-diffing the published questions CSV against the student's own receipt
-(rounds_submitted). See docs/superpowers/specs/2026-09-01-hw1-autosubmit-bot-design.md
-for the reasoning.
+Submission model (v2): answers are recorded by pushing a JSON file to this
+same public repo at answers/round-NNNN.json - course staff poll the repo and
+grade by first-seen commit, not by anything we claim locally. There is no
+receipt endpoint in this model: the only source of truth for "have I already
+answered round N" is whether answers/round-NNNN.json already exists in the
+checked-out repo, and a file is NEVER touched again once written (editing
+after being seen is ignored by staff, so overwriting would be pointless and
+risks looking like tampering).
+
+See docs/superpowers/specs/2026-09-01-hw1-autosubmit-bot-design.md and
+docs/superpowers/specs/2026-09-02-submission-model-v2-design.md.
 """
 import csv
 import io
@@ -13,17 +20,15 @@ import json
 import os
 import random
 import re
-import sys
+import subprocess
 import time
 from datetime import datetime, timezone
 
 import requests
 
 CSV_URL = "https://raw.githubusercontent.com/FaisalXL/dso429-hw1-questions/main/questions.csv"
-FORM_VIEW_URL = "https://docs.google.com/forms/d/e/1FAIpQLSc0fSvaiv3kHXv9uU-N4kaFc0K4H2NBavBFgZj4tG8WwM1GnA/viewform"
-FORM_RESPONSE_URL = "https://docs.google.com/forms/d/e/1FAIpQLSc0fSvaiv3kHXv9uU-N4kaFc0K4H2NBavBFgZj4tG8WwM1GnA/formResponse"
-RECEIPT_URL = "https://dso429-hw1-tick.dso429hw1.workers.dev/receipt"
 USER_AGENT = "Mozilla/5.0 (compatible; DSO429-HW1-Bot/1.0; +https://github.com/)"
+ANSWERS_DIR = "answers"
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite")
@@ -57,41 +62,20 @@ def fetch_csv():
     return rounds
 
 
-def fetch_receipt(email):
-    r = requests.get(RECEIPT_URL, headers=HEADERS, params={"email": email}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def round_filename(rid):
+    return f"{ANSWERS_DIR}/round-{int(rid):04d}.json"
 
 
-def get_form_entry_ids():
-    """Re-fetch the live form and parse its current entry.<id> field mapping.
-    Done fresh every call since we can't prove IDs are stable across rounds."""
-    r = requests.get(FORM_VIEW_URL, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    m = re.search(r"FB_PUBLIC_LOAD_DATA_\s*=\s*(\[.*\])\s*;", r.text, re.DOTALL)
-    if not m:
-        raise RuntimeError("could not find FB_PUBLIC_LOAD_DATA_ in form HTML")
-    data = json.loads(m.group(1))
-    fields = data[1][1]
-
-    entries = {}
-    q_num = 0
-    for f in fields:
-        title = f[1] or ""
-        entry_id = f[4][0][0]
-        if title.strip().lower() == "email":
-            entries["email"] = entry_id
-        elif title.strip().lower() == "round_id":
-            entries["round_id"] = entry_id
-        elif re.match(r"^Q\d", title.strip()):
-            q_num += 1
-            entries[f"q{q_num}"] = entry_id
-
-    required = {"email", "round_id", "q1", "q2", "q3", "q4", "q5"}
-    missing = required - entries.keys()
-    if missing:
-        raise RuntimeError(f"form is missing expected fields: {missing}")
-    return entries
+def existing_rounds():
+    """Round ids we've already written a file for, per the local checkout."""
+    if not os.path.isdir(ANSWERS_DIR):
+        return set()
+    found = set()
+    for name in os.listdir(ANSWERS_DIR):
+        m = re.match(r"^round-(\d{4})\.json$", name)
+        if m:
+            found.add(str(int(m.group(1))))
+    return found
 
 
 def ask_gemini(questions, api_key, model=GEMINI_MODEL):
@@ -162,18 +146,38 @@ def answer_round(questions, api_key):
     return {f"q{i}": random.choice("ABCD") for i in range(1, 6)}, "fallback"
 
 
-def submit_round(round_id, email, answers):
-    entries = get_form_entry_ids()
-    payload = {
-        f"entry.{entries['email']}": email,
-        f"entry.{entries['round_id']}": str(round_id),
-    }
-    for i in range(1, 6):
-        payload[f"entry.{entries[f'q{i}']}"] = answers[f"q{i}"]
+def run_git(*args, check=True):
+    return subprocess.run(
+        ["git", *args], check=check, capture_output=True, text=True
+    )
 
-    r = requests.post(FORM_RESPONSE_URL, headers=HEADERS, data=payload, timeout=30)
-    r.raise_for_status()
-    return r.status_code
+
+def push_round_file(rid, email, answers):
+    """Write answers/round-NNNN.json and push it as its own commit. Pushes as
+    soon as the file is written (not batched) since grading is by first-seen
+    push time, not commit time. Retries a couple of times against a fetch+
+    rebase if the push is rejected (e.g. an overlapping run)."""
+    os.makedirs(ANSWERS_DIR, exist_ok=True)
+    path = round_filename(rid)
+    with open(path, "w") as f:
+        json.dump({"round_id": int(rid), "email": email, "answers": answers}, f, indent=2)
+        f.write("\n")
+
+    run_git("add", path)
+    run_git("commit", "-m", f"answers for round {int(rid):04d}")
+
+    for attempt in range(3):
+        r = run_git("push", "origin", "HEAD:main", check=False)
+        if r.returncode == 0:
+            return True
+        log(f"  push attempt {attempt + 1} failed: {r.stderr.strip()[:300]}")
+        run_git("fetch", "origin", "main")
+        rebase = run_git("rebase", "origin/main", check=False)
+        if rebase.returncode != 0:
+            run_git("rebase", "--abort", check=False)
+            log("  rebase failed, aborting retries for this round")
+            return False
+    return False
 
 
 def main():
@@ -181,15 +185,11 @@ def main():
     api_key = os.environ["GEMINI_API_KEY"]
 
     rounds = fetch_csv()
-    receipt = fetch_receipt(email)
-    if not receipt.get("registered"):
-        log(f"WARNING: receipt says this email is not registered: {receipt.get('warnings')}")
-
-    already = set(str(x) for x in receipt.get("rounds_submitted", []))
-    missing = sorted((rid for rid in rounds if rid not in already), key=int)
+    have = existing_rounds()
+    missing = sorted((rid for rid in rounds if rid not in have), key=int)
 
     if not missing:
-        log(f"nothing to do — {len(already)} rounds already recorded, CSV has {len(rounds)}")
+        log(f"nothing to do — {len(have)} rounds already pushed, CSV has {len(rounds)}")
         return
 
     log(f"missing rounds: {missing}")
@@ -203,19 +203,11 @@ def main():
         answers, source = answer_round(questions, api_key)
         log(f"round {rid}: answers={answers} source={source}")
 
-        submit_round(rid, email, answers)
-
-        landed = False
-        for _ in range(4):
-            time.sleep(5)
-            check = fetch_receipt(email)
-            landed = str(rid) in set(str(x) for x in check.get("rounds_submitted", []))
-            if landed:
-                break
-        if landed:
-            log(f"round {rid}: CONFIRMED via receipt")
+        pushed = push_round_file(rid, email, answers)
+        if pushed:
+            log(f"round {rid}: PUSHED")
         else:
-            log(f"round {rid}: NOT CONFIRMED after waiting — {check.get('latest')}")
+            log(f"round {rid}: PUSH FAILED — file stays local, next run's fresh checkout will retry it")
 
 
 if __name__ == "__main__":
